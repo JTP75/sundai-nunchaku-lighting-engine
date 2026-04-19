@@ -4,8 +4,8 @@
 The Pipeline tab chains: generate → edit → animate in one flow.
 
 Usage:
-    export NUNCHAKU_API_KEY="sk-nunchaku-..."
-    pip install gradio requests Pillow
+    echo 'NUNCHAKU_API_KEY=sk-nunchaku-...' > .env
+    pip install gradio requests Pillow python-dotenv
     python demo/app.py
 """
 
@@ -15,7 +15,10 @@ import sys
 import tempfile
 
 import gradio as gr
+from dotenv import load_dotenv
 from PIL import Image
+
+load_dotenv()
 
 # Allow importing nunchaku.py from the same directory
 sys.path.insert(0, os.path.dirname(__file__))
