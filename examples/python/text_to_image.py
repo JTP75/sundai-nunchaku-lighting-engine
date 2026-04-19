@@ -4,7 +4,7 @@ Endpoint: POST /v1/images/generations
 Model:    nunchaku-qwen-image (supports tiers: fast, radically_fast)
 
 Usage:
-    export NUNCHAKU_API_KEY="sk-nunchaku-..."
+    echo 'NUNCHAKU_API_KEY=sk-nunchaku-...' > .env
     python text_to_image.py
 """
 
@@ -12,6 +12,9 @@ import base64
 import os
 
 import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 API_KEY = os.environ["NUNCHAKU_API_KEY"]
 BASE_URL = "https://api.nunchaku.dev"

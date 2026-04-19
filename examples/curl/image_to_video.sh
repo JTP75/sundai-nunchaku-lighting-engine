@@ -4,10 +4,13 @@
 # content blocks — NOT via a simple `image` field. Endpoint is /v1/video/animations.
 #
 # Usage:
-#   export NUNCHAKU_API_KEY="sk-nunchaku-..."
+#   echo 'NUNCHAKU_API_KEY=sk-nunchaku-...' > .env
 #   bash image_to_video.sh input.jpg "the scene comes to life"
 
 set -e
+
+# Load .env if present
+[ -f .env ] && export $(grep -v '^#' .env | xargs)
 
 INPUT_PATH="${1:-input.jpg}"
 PROMPT="${2:-the scene comes to life with gentle motion}"

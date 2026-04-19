@@ -2,10 +2,13 @@
 # Text-to-image with cURL.
 #
 # Usage:
-#   export NUNCHAKU_API_KEY="sk-nunchaku-..."
+#   echo 'NUNCHAKU_API_KEY=sk-nunchaku-...' > .env
 #   bash text_to_image.sh
 
 set -e
+
+# Load .env if present
+[ -f .env ] && export $(grep -v '^#' .env | xargs)
 
 curl -s https://api.nunchaku.dev/v1/images/generations \
   -H "Authorization: Bearer $NUNCHAKU_API_KEY" \

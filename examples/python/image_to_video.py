@@ -8,7 +8,7 @@ multimodal content blocks (similar to chat completions), NOT via a
 simple `image` field. This is the trickiest endpoint format.
 
 Usage:
-    export NUNCHAKU_API_KEY="sk-nunchaku-..."
+    echo 'NUNCHAKU_API_KEY=sk-nunchaku-...' > .env
     python image_to_video.py input.jpg "the scene comes to life with gentle motion"
 """
 
@@ -17,6 +17,9 @@ import os
 import sys
 
 import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 API_KEY = os.environ["NUNCHAKU_API_KEY"]
 BASE_URL = "https://api.nunchaku.dev"

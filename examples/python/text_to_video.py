@@ -7,7 +7,7 @@ Defaults for Lightning models:
     num_frames=81 (3.4s at 24fps), num_inference_steps=4, guidance_scale=1.0
 
 Usage:
-    export NUNCHAKU_API_KEY="sk-nunchaku-..."
+    echo 'NUNCHAKU_API_KEY=sk-nunchaku-...' > .env
     python text_to_video.py
 """
 
@@ -15,6 +15,9 @@ import base64
 import os
 
 import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 API_KEY = os.environ["NUNCHAKU_API_KEY"]
 BASE_URL = "https://api.nunchaku.dev"

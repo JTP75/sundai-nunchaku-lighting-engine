@@ -6,14 +6,17 @@ Non-standard parameters (tier, num_frames, etc.) go in `extra_body`.
 Install: pip install openai
 
 Usage:
-    export NUNCHAKU_API_KEY="sk-nunchaku-..."
+    echo 'NUNCHAKU_API_KEY=sk-nunchaku-...' > .env
     python openai_sdk.py
 """
 
 import base64
 import os
 
+from dotenv import load_dotenv
 from openai import OpenAI
+
+load_dotenv()
 
 client = OpenAI(
     base_url="https://api.nunchaku.dev/v1",

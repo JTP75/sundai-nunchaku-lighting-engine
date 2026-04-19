@@ -3,3 +3,4 @@ gradio
 openai
 Pillow
 pytest
+python-dotenv

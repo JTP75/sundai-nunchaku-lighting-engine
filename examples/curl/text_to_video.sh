@@ -3,10 +3,13 @@
 # Note: endpoint is /v1/video/ (no 's'), not /v1/videos/.
 #
 # Usage:
-#   export NUNCHAKU_API_KEY="sk-nunchaku-..."
+#   echo 'NUNCHAKU_API_KEY=sk-nunchaku-...' > .env
 #   bash text_to_video.sh
 
 set -e
+
+# Load .env if present
+[ -f .env ] && export $(grep -v '^#' .env | xargs)
 
 echo "Generating video (this may take ~30 seconds)..."
 

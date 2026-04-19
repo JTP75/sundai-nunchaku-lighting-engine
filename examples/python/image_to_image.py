@@ -7,7 +7,7 @@ NOTE: The input image is passed via the `url` field as a data URI,
       NOT as a separate `image` field.
 
 Usage:
-    export NUNCHAKU_API_KEY="sk-nunchaku-..."
+    echo 'NUNCHAKU_API_KEY=sk-nunchaku-...' > .env
     python image_to_image.py input.jpg "make it look like a watercolor painting"
 """
 
@@ -16,6 +16,9 @@ import os
 import sys
 
 import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 API_KEY = os.environ["NUNCHAKU_API_KEY"]
 BASE_URL = "https://api.nunchaku.dev"

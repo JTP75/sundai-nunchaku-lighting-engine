@@ -3,10 +3,13 @@
 # Input image goes in the `url` field as a data URI — not a file upload.
 #
 # Usage:
-#   export NUNCHAKU_API_KEY="sk-nunchaku-..."
+#   echo 'NUNCHAKU_API_KEY=sk-nunchaku-...' > .env
 #   bash image_to_image.sh input.jpg "make it a watercolor painting"
 
 set -e
+
+# Load .env if present
+[ -f .env ] && export $(grep -v '^#' .env | xargs)
 
 INPUT_PATH="${1:-input.jpg}"
 PROMPT="${2:-transform this into a watercolor painting}"
