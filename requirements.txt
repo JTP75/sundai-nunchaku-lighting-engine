@@ -4,3 +4,4 @@ openai
 Pillow
 pytest
 python-dotenv
+pygltflib

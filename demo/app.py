@@ -10,9 +10,14 @@ Usage:
 """
 
 import io
+import logging
 import os
+import random
+import shutil
 import sys
 import tempfile
+import time
+from pathlib import Path
 
 import gradio as gr
 from dotenv import load_dotenv
@@ -20,9 +25,31 @@ from PIL import Image
 
 load_dotenv()
 
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("nunchaku_demo")
+
+# Surface Gradio + uvicorn file-serving traffic so we can see which paths the
+# browser requests. httpx/httpcore stay quiet — they're mostly outbound Nunchaku
+# traffic which we already log ourselves.
+for name in ("gradio", "gradio_client", "uvicorn", "uvicorn.access", "uvicorn.error"):
+    logging.getLogger(name).setLevel(logging.DEBUG)
+for name in ("httpx", "httpcore"):
+    logging.getLogger(name).setLevel(logging.WARNING)
+
 # Allow importing nunchaku.py from the same directory
 sys.path.insert(0, os.path.dirname(__file__))
 from nunchaku import NunchakuClient
+from variation_factory import (
+    build_prompt,
+    extract_albedo_textures,
+    replace_albedo_textures,
+    sanitize_glb,
+    snap_to_valid_size,
+)
 
 # ---------------------------------------------------------------------------
 # Models & options
@@ -169,6 +196,159 @@ def tab_pipeline(gen_prompt, edit_prompt, animate_prompt, tier):
 
 
 # ---------------------------------------------------------------------------
+# Tab 6: Variation Factory (GLB albedo variants)
+# ---------------------------------------------------------------------------
+
+MAX_VARIANTS = 10
+
+
+def _describe_glb(path: Path) -> str:
+    """Short diagnostic string: size, first 4 bytes (magic), exists flag."""
+    try:
+        exists = path.exists()
+        size = path.stat().st_size if exists else 0
+        magic = b""
+        if exists and size >= 4:
+            with open(path, "rb") as f:
+                magic = f.read(4)
+        return f"exists={exists} size={size} magic={magic!r} abs={path.resolve()}"
+    except Exception as e:
+        return f"<error describing {path}: {e}>"
+
+
+def tab_variation_factory(glb_file, n, intensity, extra, quality, seed_in):
+    run_started = time.time()
+    if glb_file is None:
+        logger.warning("variation_factory invoked with no file")
+        raise gr.Error("Upload a .glb or .gltf file first.")
+
+    glb_path = Path(glb_file if isinstance(glb_file, str) else glb_file.name)
+    n = int(n)
+    tier = "radically_fast" if "radically_fast" in quality else "fast"
+
+    logger.info(
+        "variation_factory start: file=%s n=%d intensity=%s tier=%s seed_in=%s prompt=%r",
+        glb_path.name, n, intensity, tier, seed_in, extra or "",
+    )
+
+    base_seed = random.randint(1, 2**31 - 1) if int(seed_in) == 0 else int(seed_in)
+    output_root = Path("output")
+    output_root.mkdir(exist_ok=True)
+    out_dir = Path(tempfile.mkdtemp(prefix="variation_factory_", dir=output_root))
+
+    stem = glb_path.stem
+    logger.info("upload received: %s", _describe_glb(glb_path))
+
+    sanitized_base = out_dir / f"{stem}_sanitized.glb"
+    try:
+        sanitize_glb(glb_path, sanitized_base)
+    except Exception as e:
+        logger.exception("sanitize_glb failed: %s", e)
+        raise gr.Error(f"Could not parse GLB: {e}")
+    logger.info("sanitized base: %s", _describe_glb(sanitized_base))
+
+    try:
+        extracted = extract_albedo_textures(sanitized_base)
+    except ValueError as e:
+        logger.error("texture extraction failed: %s", e)
+        raise gr.Error(str(e))
+
+    prompt = build_prompt(intensity, extra or "")
+
+    sample = Image.open(io.BytesIO(extracted[0][1]))
+    w, h = snap_to_valid_size(*sample.size)
+    size_str = f"{w}x{h}"
+    logger.info(
+        "prompt=%r  size=%s  base_seed=%d  out_dir=%s  source_dims=%dx%d",
+        prompt, size_str, base_seed, out_dir, sample.size[0], sample.size[1],
+    )
+
+    total_slots = n + 1
+    orig_out = out_dir / f"{stem}_variant_0.glb"
+    shutil.copy(sanitized_base, orig_out)
+    logger.info("variant_0 (original copy): %s", _describe_glb(orig_out))
+
+    variants: list[dict] = [
+        {"label": "variant_0 (original)", "path": str(orig_out), "error": None}
+    ]
+
+    def _downloads() -> list[str]:
+        return [v["path"] for v in variants if v["path"]]
+
+    logger.info("initial yield: showing variant_0 at %s", orig_out)
+    yield (
+        f"1/{total_slots} ready. Generating variants at {size_str}, tier={tier}, seed={base_seed}...",
+        variants,
+        _downloads(),
+    )
+
+    client = NunchakuClient()
+    success = 1
+
+    for v in range(1, n + 1):
+        variant_seed = base_seed + v
+        v_started = time.time()
+        logger.info("variant %d/%d: starting (seed=%d)", v, n, variant_seed)
+        entry: dict = {"label": f"variant_{v}", "path": None, "error": None}
+        try:
+            replacements: dict[int, bytes] = {}
+            for img_idx, orig_bytes, _mime in extracted:
+                src = Image.open(io.BytesIO(orig_bytes)).convert("RGB")
+                if src.size != (w, h):
+                    src = src.resize((w, h), Image.LANCZOS)
+                buf = io.BytesIO()
+                src.save(buf, format="PNG")
+                input_bytes = buf.getvalue()
+
+                api_started = time.time()
+                logger.debug(
+                    "  variant %d img[%d]: calling /v1/images/edits (%d bytes in, size=%s, seed=%d)",
+                    v, img_idx, len(input_bytes), size_str, variant_seed,
+                )
+                result_bytes = client.edit_image(
+                    image=input_bytes,
+                    prompt=prompt,
+                    model="nunchaku-qwen-image-edit",
+                    tier=tier,
+                    size=size_str,
+                    seed=variant_seed,
+                    output_format="png",
+                )
+                logger.info(
+                    "  variant %d img[%d]: api ok in %.2fs (%d bytes out)",
+                    v, img_idx, time.time() - api_started, len(result_bytes),
+                )
+                replacements[img_idx] = result_bytes
+
+            variant_out = out_dir / f"{stem}_variant_{v}.glb"
+            replace_albedo_textures(sanitized_base, replacements, variant_out, new_mime="image/png")
+
+            entry["path"] = str(variant_out)
+            success += 1
+            logger.info("variant %d/%d: done in %.2fs -> %s", v, n, time.time() - v_started, variant_out.name)
+        except Exception as e:
+            logger.exception("variant %d/%d: FAILED after %.2fs", v, n, time.time() - v_started)
+            entry["error"] = str(e)
+
+        variants.append(entry)
+        yield (
+            f"{success}/{total_slots} ready (variant {v} of {n} processed)...",
+            variants,
+            _downloads(),
+        )
+
+    logger.info(
+        "variation_factory done: %d/%d variants in %.2fs, base_seed=%d, out_dir=%s",
+        success, total_slots, time.time() - run_started, base_seed, out_dir,
+    )
+    yield (
+        f"Done. {success}/{total_slots} variants produced. Base seed: {base_seed}. Files in {out_dir}",
+        variants,
+        _downloads(),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Gradio UI
 # ---------------------------------------------------------------------------
 
@@ -176,83 +356,140 @@ with gr.Blocks(title="Nunchaku Creative Pipeline", theme=gr.themes.Soft()) as ap
     gr.Markdown("# Nunchaku Creative Pipeline")
     gr.Markdown("Generate, edit, and animate images using the Nunchaku API.")
 
-    # -- Tab 1: Text-to-Image --
-    with gr.Tab("Text to Image"):
-        with gr.Row():
-            with gr.Column():
-                t2i_prompt = gr.Textbox(label="Prompt", lines=3, placeholder="Describe the image...")
-                t2i_model = gr.Dropdown(T2I_MODELS, value=T2I_MODELS[0], label="Model")
-                t2i_size = gr.Dropdown(IMAGE_SIZES, value="1024x1024", label="Size")
-                t2i_tier = gr.Dropdown(TIERS, value="fast", label="Tier")
-                t2i_seed = gr.Number(value=-1, label="Seed (-1 = random)")
-                t2i_btn = gr.Button("Generate", variant="primary")
-            with gr.Column():
-                t2i_output = gr.Image(label="Result", type="pil")
-        t2i_btn.click(tab_text_to_image, [t2i_prompt, t2i_model, t2i_size, t2i_tier, t2i_seed], t2i_output)
+    # Tabs 1-5 hidden from display (code kept for later re-enable).
+    if False:
+        # -- Tab 1: Text-to-Image --
+        with gr.Tab("Text to Image"):
+            with gr.Row():
+                with gr.Column():
+                    t2i_prompt = gr.Textbox(label="Prompt", lines=3, placeholder="Describe the image...")
+                    t2i_model = gr.Dropdown(T2I_MODELS, value=T2I_MODELS[0], label="Model")
+                    t2i_size = gr.Dropdown(IMAGE_SIZES, value="1024x1024", label="Size")
+                    t2i_tier = gr.Dropdown(TIERS, value="fast", label="Tier")
+                    t2i_seed = gr.Number(value=-1, label="Seed (-1 = random)")
+                    t2i_btn = gr.Button("Generate", variant="primary")
+                with gr.Column():
+                    t2i_output = gr.Image(label="Result", type="pil")
+            t2i_btn.click(tab_text_to_image, [t2i_prompt, t2i_model, t2i_size, t2i_tier, t2i_seed], t2i_output)
 
-    # -- Tab 2: Edit Image --
-    with gr.Tab("Edit Image"):
-        with gr.Row():
-            with gr.Column():
-                i2i_input = gr.Image(label="Input Image", type="pil")
-                i2i_prompt = gr.Textbox(label="Edit Prompt", lines=2, placeholder="Describe the edit...")
-                i2i_model = gr.Dropdown(I2I_MODELS, value=I2I_MODELS[0], label="Model")
-                i2i_tier = gr.Dropdown(TIERS, value="fast", label="Tier")
-                i2i_btn = gr.Button("Edit", variant="primary")
-            with gr.Column():
-                i2i_output = gr.Image(label="Result", type="pil")
-        i2i_btn.click(tab_edit_image, [i2i_input, i2i_prompt, i2i_model, i2i_tier], i2i_output)
+        # -- Tab 2: Edit Image --
+        with gr.Tab("Edit Image"):
+            with gr.Row():
+                with gr.Column():
+                    i2i_input = gr.Image(label="Input Image", type="pil")
+                    i2i_prompt = gr.Textbox(label="Edit Prompt", lines=2, placeholder="Describe the edit...")
+                    i2i_model = gr.Dropdown(I2I_MODELS, value=I2I_MODELS[0], label="Model")
+                    i2i_tier = gr.Dropdown(TIERS, value="fast", label="Tier")
+                    i2i_btn = gr.Button("Edit", variant="primary")
+                with gr.Column():
+                    i2i_output = gr.Image(label="Result", type="pil")
+            i2i_btn.click(tab_edit_image, [i2i_input, i2i_prompt, i2i_model, i2i_tier], i2i_output)
 
-    # -- Tab 3: Text-to-Video --
-    with gr.Tab("Text to Video"):
-        with gr.Row():
-            with gr.Column():
-                t2v_prompt = gr.Textbox(label="Prompt", lines=3, placeholder="Describe the video...")
-                t2v_model = gr.Dropdown(T2V_MODELS, value=T2V_MODELS[0], label="Model")
-                t2v_size = gr.Dropdown(VIDEO_SIZES, value="1280x720", label="Size")
-                t2v_btn = gr.Button("Generate Video", variant="primary")
-                gr.Markdown("*Video generation takes ~30 seconds.*")
-            with gr.Column():
-                t2v_output = gr.Video(label="Result")
-        t2v_btn.click(tab_text_to_video, [t2v_prompt, t2v_model, t2v_size], t2v_output)
+        # -- Tab 3: Text-to-Video --
+        with gr.Tab("Text to Video"):
+            with gr.Row():
+                with gr.Column():
+                    t2v_prompt = gr.Textbox(label="Prompt", lines=3, placeholder="Describe the video...")
+                    t2v_model = gr.Dropdown(T2V_MODELS, value=T2V_MODELS[0], label="Model")
+                    t2v_size = gr.Dropdown(VIDEO_SIZES, value="1280x720", label="Size")
+                    t2v_btn = gr.Button("Generate Video", variant="primary")
+                    gr.Markdown("*Video generation takes ~30 seconds.*")
+                with gr.Column():
+                    t2v_output = gr.Video(label="Result")
+            t2v_btn.click(tab_text_to_video, [t2v_prompt, t2v_model, t2v_size], t2v_output)
 
-    # -- Tab 4: Image-to-Video --
-    with gr.Tab("Image to Video"):
-        with gr.Row():
-            with gr.Column():
-                i2v_input = gr.Image(label="Input Image", type="pil")
-                i2v_prompt = gr.Textbox(label="Prompt", lines=2, placeholder="Describe the motion...")
-                i2v_model = gr.Dropdown(I2V_MODELS, value=I2V_MODELS[0], label="Model")
-                i2v_size = gr.Dropdown(VIDEO_SIZES, value="1280x720", label="Size")
-                i2v_btn = gr.Button("Animate", variant="primary")
-                gr.Markdown("*Video generation takes ~30 seconds.*")
-            with gr.Column():
-                i2v_output = gr.Video(label="Result")
-        i2v_btn.click(tab_image_to_video, [i2v_input, i2v_prompt, i2v_model, i2v_size], i2v_output)
+        # -- Tab 4: Image-to-Video --
+        with gr.Tab("Image to Video"):
+            with gr.Row():
+                with gr.Column():
+                    i2v_input = gr.Image(label="Input Image", type="pil")
+                    i2v_prompt = gr.Textbox(label="Prompt", lines=2, placeholder="Describe the motion...")
+                    i2v_model = gr.Dropdown(I2V_MODELS, value=I2V_MODELS[0], label="Model")
+                    i2v_size = gr.Dropdown(VIDEO_SIZES, value="1280x720", label="Size")
+                    i2v_btn = gr.Button("Animate", variant="primary")
+                    gr.Markdown("*Video generation takes ~30 seconds.*")
+                with gr.Column():
+                    i2v_output = gr.Video(label="Result")
+            i2v_btn.click(tab_image_to_video, [i2v_input, i2v_prompt, i2v_model, i2v_size], i2v_output)
 
-    # -- Tab 5: Pipeline --
-    with gr.Tab("Pipeline"):
-        gr.Markdown("### Generate → Edit → Animate")
-        gr.Markdown("Chain all three endpoints into one creative flow.")
+        # -- Tab 5: Pipeline --
+        with gr.Tab("Pipeline"):
+            gr.Markdown("### Generate → Edit → Animate")
+            gr.Markdown("Chain all three endpoints into one creative flow.")
+            with gr.Row():
+                with gr.Column():
+                    pipe_gen = gr.Textbox(label="1. Generate prompt", lines=2, value="a cozy cabin in the mountains at sunset")
+                    pipe_edit = gr.Textbox(label="2. Edit prompt", lines=2, value="add snow falling and northern lights in the sky")
+                    pipe_animate = gr.Textbox(label="3. Animate prompt", lines=2, value="snow gently falling, lights dancing in the sky")
+                    pipe_tier = gr.Dropdown(TIERS, value="fast", label="Tier (for image steps)")
+                    pipe_btn = gr.Button("Run Pipeline", variant="primary")
+                with gr.Column():
+                    pipe_status = gr.Textbox(label="Status", interactive=False)
+                    pipe_gen_out = gr.Image(label="Generated Image", type="pil")
+                    pipe_edit_out = gr.Image(label="Edited Image", type="pil")
+                    pipe_video_out = gr.Video(label="Final Video")
+            pipe_btn.click(
+                tab_pipeline,
+                [pipe_gen, pipe_edit, pipe_animate, pipe_tier],
+                [pipe_status, pipe_gen_out, pipe_edit_out, pipe_video_out],
+            )
+
+    # -- Tab 6: Variation Factory --
+    with gr.Tab("Variation Factory"):
+        gr.Markdown("### Game Asset Variation Factory")
+        gr.Markdown(
+            "Upload a `.glb` / `.gltf` file, pick a style, and generate N texture variants. "
+            "Each variant is a full GLB with a re-skinned albedo — drop it into Unity, Unreal, Blender, or any viewer."
+        )
         with gr.Row():
-            with gr.Column():
-                pipe_gen = gr.Textbox(label="1. Generate prompt", lines=2, value="a cozy cabin in the mountains at sunset")
-                pipe_edit = gr.Textbox(label="2. Edit prompt", lines=2, value="add snow falling and northern lights in the sky")
-                pipe_animate = gr.Textbox(label="3. Animate prompt", lines=2, value="snow gently falling, lights dancing in the sky")
-                pipe_tier = gr.Dropdown(TIERS, value="fast", label="Tier (for image steps)")
-                pipe_btn = gr.Button("Run Pipeline", variant="primary")
-            with gr.Column():
-                pipe_status = gr.Textbox(label="Status", interactive=False)
-                pipe_gen_out = gr.Image(label="Generated Image", type="pil")
-                pipe_edit_out = gr.Image(label="Edited Image", type="pil")
-                pipe_video_out = gr.Video(label="Final Video")
-        pipe_btn.click(
-            tab_pipeline,
-            [pipe_gen, pipe_edit, pipe_animate, pipe_tier],
-            [pipe_status, pipe_gen_out, pipe_edit_out, pipe_video_out],
+            with gr.Column(scale=1):
+                vf_file = gr.File(label="GLB / GLTF file", file_types=[".glb", ".gltf"], type="filepath")
+                vf_n = gr.Slider(1, MAX_VARIANTS, value=4, step=1, label="Number of variants")
+                vf_intensity = gr.Radio(["Subtle", "Moderate", "Heavy"], value="Subtle", label="Intensity")
+                vf_extra = gr.Textbox(label="Prompt", placeholder="e.g., rusted and oxidized, with green patina", lines=3)
+                vf_quality = gr.Dropdown(
+                    ["draft (radically_fast)", "final (fast)"],
+                    value="draft (radically_fast)",
+                    label="Quality",
+                )
+                vf_seed = gr.Number(value=0, label="Base seed (0 = random)", precision=0)
+                vf_btn = gr.Button("Generate variants", variant="primary")
+                vf_status = gr.Textbox(label="Status", interactive=False)
+            with gr.Column(scale=2):
+                vf_variants = gr.State([])
+                vf_download = gr.File(label="Download .glb files", file_count="multiple", interactive=False)
+
+                @gr.render(inputs=[vf_variants])
+                def render_variants(variants):
+                    if not variants:
+                        gr.Markdown("_Upload a GLB and click Generate to see variants here._")
+                        return
+                    for entry in variants:
+                        if entry.get("error"):
+                            gr.Markdown(f"**{entry['label']}**\n\nFailed: {entry['error']}")
+                        else:
+                            gr.Model3D(
+                                value=entry["path"],
+                                label=entry["label"],
+                                clear_color=[0.1, 0.1, 0.1, 1.0],
+                            )
+
+        vf_btn.click(
+            tab_variation_factory,
+            [vf_file, vf_n, vf_intensity, vf_extra, vf_quality, vf_seed],
+            [vf_status, vf_variants, vf_download],
         )
 
 if __name__ == "__main__":
     if not os.environ.get("NUNCHAKU_API_KEY"):
         print("Warning: NUNCHAKU_API_KEY not set. Set it before using the app.")
-    app.launch(share=False)
+    output_dir = Path("output").resolve()
+    output_dir.mkdir(exist_ok=True)
+    allowed = [str(output_dir), tempfile.gettempdir()]
+    logger.info("Gradio allowed_paths: %s", allowed)
+    app.queue(default_concurrency_limit=4).launch(
+        share=False,
+        allowed_paths=allowed,
+        debug=True,
+        show_error=True,
+    )
