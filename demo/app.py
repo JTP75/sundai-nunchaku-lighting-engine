@@ -10,11 +10,13 @@ Usage:
 """
 
 import io
+import logging
 import os
 import random
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import gradio as gr
@@ -22,6 +24,13 @@ from dotenv import load_dotenv
 from PIL import Image
 
 load_dotenv()
+
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("nunchaku_demo")
 
 # Allow importing nunchaku.py from the same directory
 sys.path.insert(0, os.path.dirname(__file__))
@@ -31,6 +40,7 @@ from variation_factory import (
     build_prompt,
     extract_albedo_textures,
     replace_albedo_textures,
+    sanitize_glb,
     snap_to_valid_size,
 )
 
@@ -187,48 +197,80 @@ MAX_SLOTS = MAX_VARIANTS + 1  # variant_0 (original) + N variants
 
 
 def tab_variation_factory(glb_file, n, preset, intensity, extra, quality, seed_in):
+    run_started = time.time()
     if glb_file is None:
+        logger.warning("variation_factory invoked with no file")
         raise gr.Error("Upload a .glb or .gltf file first.")
 
     glb_path = Path(glb_file if isinstance(glb_file, str) else glb_file.name)
     n = int(n)
     tier = "radically_fast" if "radically_fast" in quality else "fast"
 
-    try:
-        extracted = extract_albedo_textures(glb_path)
-    except ValueError as e:
-        raise gr.Error(str(e))
+    logger.info(
+        "variation_factory start: file=%s n=%d preset=%s intensity=%s tier=%s seed_in=%s extra=%r",
+        glb_path.name, n, preset, intensity, tier, seed_in, extra or "",
+    )
 
     base_seed = random.randint(1, 2**31 - 1) if int(seed_in) == 0 else int(seed_in)
-    out_dir = Path(tempfile.mkdtemp(prefix="variation_factory_"))
+    output_root = Path("output")
+    output_root.mkdir(exist_ok=True)
+    out_dir = Path(tempfile.mkdtemp(prefix="variation_factory_", dir=output_root))
+
+    stem = glb_path.stem
+    sanitized_base = out_dir / f"{stem}_sanitized.glb"
+    try:
+        sanitize_glb(glb_path, sanitized_base)
+    except Exception as e:
+        logger.exception("sanitize_glb failed: %s", e)
+        raise gr.Error(f"Could not parse GLB: {e}")
+
+    try:
+        extracted = extract_albedo_textures(sanitized_base)
+    except ValueError as e:
+        logger.error("texture extraction failed: %s", e)
+        raise gr.Error(str(e))
+
     prompt = build_prompt(preset, intensity, extra or "")
 
     sample = Image.open(io.BytesIO(extracted[0][1]))
     w, h = snap_to_valid_size(*sample.size)
     size_str = f"{w}x{h}"
+    logger.info(
+        "prompt=%r  size=%s  base_seed=%d  out_dir=%s  source_dims=%dx%d",
+        prompt, size_str, base_seed, out_dir, sample.size[0], sample.size[1],
+    )
 
     total_slots = n + 1
-    slot_models = [gr.update(value=None, visible=False) for _ in range(MAX_SLOTS)]
-    slot_errors = [gr.update(value="", visible=False) for _ in range(MAX_SLOTS)]
-    for i in range(total_slots):
-        slot_models[i] = gr.update(value=None, visible=True, label=f"variant_{i}")
-
-    stem = glb_path.stem
     orig_out = out_dir / f"{stem}_variant_0.glb"
-    shutil.copy(glb_path, orig_out)
-    slot_models[0] = gr.update(value=str(orig_out), visible=True, label="variant_0 (original)")
+    shutil.copy(sanitized_base, orig_out)
+
+    # Initial yield uses gr.update() to set visibility and labels; subsequent
+    # yields pass plain values so Gradio preserves visibility and re-renders
+    # the Model3D viewers correctly.
+    init_models = [gr.update(value=None, visible=False) for _ in range(MAX_SLOTS)]
+    init_errors = [gr.update(value="", visible=False) for _ in range(MAX_SLOTS)]
+    for i in range(total_slots):
+        init_models[i] = gr.update(value=None, visible=True, label=f"variant_{i}")
+    init_models[0] = gr.update(value=str(orig_out), visible=True, label="variant_0 (original)")
 
     yield (
         f"1/{total_slots} ready. Generating variants at {size_str}, tier={tier}, seed={base_seed}...",
-        *slot_models,
-        *slot_errors,
+        *init_models,
+        *init_errors,
     )
+
+    # Track slot values as plain Python values from here on
+    model_values: list[str | None] = [None] * MAX_SLOTS
+    model_values[0] = str(orig_out)
+    error_values: list[str] = [""] * MAX_SLOTS
 
     client = NunchakuClient()
     success = 1
 
     for v in range(1, n + 1):
         variant_seed = base_seed + v
+        v_started = time.time()
+        logger.info("variant %d/%d: starting (seed=%d)", v, n, variant_seed)
         try:
             replacements: dict[int, bytes] = {}
             for img_idx, orig_bytes, _mime in extracted:
@@ -239,6 +281,11 @@ def tab_variation_factory(glb_file, n, preset, intensity, extra, quality, seed_i
                 src.save(buf, format="PNG")
                 input_bytes = buf.getvalue()
 
+                api_started = time.time()
+                logger.debug(
+                    "  variant %d img[%d]: calling /v1/images/edits (%d bytes in, size=%s, seed=%d)",
+                    v, img_idx, len(input_bytes), size_str, variant_seed,
+                )
                 result_bytes = client.edit_image(
                     image=input_bytes,
                     prompt=prompt,
@@ -248,28 +295,38 @@ def tab_variation_factory(glb_file, n, preset, intensity, extra, quality, seed_i
                     seed=variant_seed,
                     output_format="png",
                 )
+                logger.info(
+                    "  variant %d img[%d]: api ok in %.2fs (%d bytes out)",
+                    v, img_idx, time.time() - api_started, len(result_bytes),
+                )
                 replacements[img_idx] = result_bytes
 
             variant_out = out_dir / f"{stem}_variant_{v}.glb"
-            replace_albedo_textures(glb_path, replacements, variant_out, new_mime="image/png")
+            replace_albedo_textures(sanitized_base, replacements, variant_out, new_mime="image/png")
 
-            slot_models[v] = gr.update(value=str(variant_out), visible=True, label=f"variant_{v}")
-            slot_errors[v] = gr.update(value="", visible=False)
+            model_values[v] = str(variant_out)
+            error_values[v] = ""
             success += 1
+            logger.info("variant %d/%d: done in %.2fs -> %s", v, n, time.time() - v_started, variant_out.name)
         except Exception as e:
-            slot_models[v] = gr.update(value=None, visible=True, label=f"variant_{v} (failed)")
-            slot_errors[v] = gr.update(value=f"Error: {e}", visible=True)
+            logger.exception("variant %d/%d: FAILED after %.2fs", v, n, time.time() - v_started)
+            model_values[v] = None
+            error_values[v] = f"Error: {e}"
 
         yield (
             f"{success}/{total_slots} ready (variant {v} of {n} processed)...",
-            *slot_models,
-            *slot_errors,
+            *model_values,
+            *error_values,
         )
 
+    logger.info(
+        "variation_factory done: %d/%d variants in %.2fs, base_seed=%d, out_dir=%s",
+        success, total_slots, time.time() - run_started, base_seed, out_dir,
+    )
     yield (
         f"Done. {success}/{total_slots} variants produced. Base seed: {base_seed}. Files in {out_dir}",
-        *slot_models,
-        *slot_errors,
+        *model_values,
+        *error_values,
     )
 
 
@@ -400,4 +457,11 @@ with gr.Blocks(title="Nunchaku Creative Pipeline", theme=gr.themes.Soft()) as ap
 if __name__ == "__main__":
     if not os.environ.get("NUNCHAKU_API_KEY"):
         print("Warning: NUNCHAKU_API_KEY not set. Set it before using the app.")
-    app.launch(share=False)
+    output_dir = Path("output").resolve()
+    output_dir.mkdir(exist_ok=True)
+    allowed = [str(output_dir), tempfile.gettempdir()]
+    logger.info("Gradio allowed_paths: %s", allowed)
+    app.queue(default_concurrency_limit=4).launch(
+        share=False,
+        allowed_paths=allowed,
+    )

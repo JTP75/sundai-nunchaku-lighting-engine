@@ -4,9 +4,12 @@ Extracts embedded albedo textures from a GLB, lets callers substitute new
 image bytes, and writes out a modified GLB with updated bufferView offsets.
 """
 
+import logging
 from pathlib import Path
 
 from pygltflib import GLTF2
+
+logger = logging.getLogger(__name__)
 
 PRESETS = {
     "Rusted": "rusted and oxidized",
@@ -44,6 +47,52 @@ def snap_to_valid_size(w: int, h: int) -> tuple[int, int]:
     return target, target
 
 
+def sanitize_glb(input_path: str | Path, output_path: str | Path) -> Path:
+    """Strip glTF extensions so minimal viewers (e.g. Gradio's Model3D) can load it.
+
+    Clears `extensionsUsed` / `extensionsRequired` at the document level and
+    any per-object `extensions` dicts on materials, textures, samplers, images,
+    meshes, primitives, and nodes. Base color textures are kept intact — only
+    the extension metadata is removed.
+    """
+    logger.info("sanitize_glb: %s -> %s", input_path, output_path)
+    gltf = GLTF2().load(str(input_path))
+
+    stripped_used = list(gltf.extensionsUsed or [])
+    stripped_required = list(gltf.extensionsRequired or [])
+    gltf.extensionsUsed = []
+    gltf.extensionsRequired = []
+
+    def clear(objs):
+        for o in objs or []:
+            if getattr(o, "extensions", None):
+                o.extensions = {}
+            if getattr(o, "extras", None):
+                o.extras = {}
+
+    clear(gltf.materials)
+    clear(gltf.textures)
+    clear(gltf.samplers)
+    clear(gltf.images)
+    clear(gltf.nodes)
+    clear(gltf.accessors)
+    clear(gltf.bufferViews)
+    clear(gltf.buffers)
+    clear(gltf.scenes)
+    for mesh in gltf.meshes or []:
+        if getattr(mesh, "extensions", None):
+            mesh.extensions = {}
+        clear(getattr(mesh, "primitives", None))
+
+    output_path = Path(output_path)
+    gltf.save(str(output_path))
+    logger.info(
+        "sanitized: removed extensionsUsed=%s extensionsRequired=%s, wrote %d bytes",
+        stripped_used, stripped_required, output_path.stat().st_size,
+    )
+    return output_path
+
+
 def _albedo_image_indices(gltf: GLTF2) -> list[int]:
     """Return sorted list of image indices used as baseColor textures."""
     indices = set()
@@ -66,9 +115,11 @@ def extract_albedo_textures(glb_path: str | Path) -> list[tuple[int, bytes, str]
     Raises ValueError if the GLB has no albedo texture or the texture is
     external (stored by URI instead of bufferView).
     """
+    logger.info("extract_albedo_textures: loading %s", glb_path)
     gltf = GLTF2().load(str(glb_path))
     blob = gltf.binary_blob() or b""
     indices = _albedo_image_indices(gltf)
+    logger.debug("albedo image indices: %s (total images in glb: %d)", indices, len(gltf.images))
     if not indices:
         raise ValueError("No albedo (baseColor) texture found in GLB.")
 
@@ -83,6 +134,12 @@ def extract_albedo_textures(glb_path: str | Path) -> list[tuple[int, bytes, str]
         start = bv.byteOffset or 0
         end = start + bv.byteLength
         results.append((img_idx, bytes(blob[start:end]), img.mimeType or "image/png"))
+    logger.info(
+        "extracted %d albedo texture(s): sizes=%s mimes=%s",
+        len(results),
+        [len(b) for _, b, _ in results],
+        [m for _, _, m in results],
+    )
     return results
 
 
@@ -98,6 +155,10 @@ def replace_albedo_textures(
     Handles arbitrary size changes by rebuilding the binary blob with
     recomputed bufferView offsets.
     """
+    logger.info(
+        "replace_albedo_textures: %s -> %s, replacing %d image(s)",
+        glb_path, output_path, len(replacements),
+    )
     gltf = GLTF2().load(str(glb_path))
     blob = gltf.binary_blob() or b""
 
@@ -108,6 +169,8 @@ def replace_albedo_textures(
         if bv_idx is None:
             raise ValueError(f"Image {img_idx} is not stored in a bufferView.")
         bv_replacements[bv_idx] = new_bytes
+        old_len = gltf.bufferViews[bv_idx].byteLength
+        logger.debug("  image[%d] bv[%d]: %d -> %d bytes", img_idx, bv_idx, old_len, len(new_bytes))
 
     # Rebuild the binary blob. Walk bufferViews in original byteOffset order so
     # that any accessor references that depend on stable ordering keep working.
@@ -157,4 +220,5 @@ def replace_albedo_textures(
     gltf.set_binary_blob(new_blob)
     output_path = Path(output_path)
     gltf.save(str(output_path))
+    logger.info("wrote %s (%d bytes, blob=%d bytes)", output_path, output_path.stat().st_size, len(new_blob))
     return output_path
