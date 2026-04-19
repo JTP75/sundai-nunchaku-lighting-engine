@@ -11,8 +11,11 @@ Usage:
 
 import io
 import os
+import random
+import shutil
 import sys
 import tempfile
+from pathlib import Path
 
 import gradio as gr
 from dotenv import load_dotenv
@@ -23,6 +26,13 @@ load_dotenv()
 # Allow importing nunchaku.py from the same directory
 sys.path.insert(0, os.path.dirname(__file__))
 from nunchaku import NunchakuClient
+from variation_factory import (
+    PRESETS,
+    build_prompt,
+    extract_albedo_textures,
+    replace_albedo_textures,
+    snap_to_valid_size,
+)
 
 # ---------------------------------------------------------------------------
 # Models & options
@@ -169,6 +179,101 @@ def tab_pipeline(gen_prompt, edit_prompt, animate_prompt, tier):
 
 
 # ---------------------------------------------------------------------------
+# Tab 6: Variation Factory (GLB albedo variants)
+# ---------------------------------------------------------------------------
+
+MAX_VARIANTS = 10
+MAX_SLOTS = MAX_VARIANTS + 1  # variant_0 (original) + N variants
+
+
+def tab_variation_factory(glb_file, n, preset, intensity, extra, quality, seed_in):
+    if glb_file is None:
+        raise gr.Error("Upload a .glb or .gltf file first.")
+
+    glb_path = Path(glb_file if isinstance(glb_file, str) else glb_file.name)
+    n = int(n)
+    tier = "radically_fast" if "radically_fast" in quality else "fast"
+
+    try:
+        extracted = extract_albedo_textures(glb_path)
+    except ValueError as e:
+        raise gr.Error(str(e))
+
+    base_seed = random.randint(1, 2**31 - 1) if int(seed_in) == 0 else int(seed_in)
+    out_dir = Path(tempfile.mkdtemp(prefix="variation_factory_"))
+    prompt = build_prompt(preset, intensity, extra or "")
+
+    sample = Image.open(io.BytesIO(extracted[0][1]))
+    w, h = snap_to_valid_size(*sample.size)
+    size_str = f"{w}x{h}"
+
+    total_slots = n + 1
+    slot_models = [gr.update(value=None, visible=False) for _ in range(MAX_SLOTS)]
+    slot_errors = [gr.update(value="", visible=False) for _ in range(MAX_SLOTS)]
+    for i in range(total_slots):
+        slot_models[i] = gr.update(value=None, visible=True, label=f"variant_{i}")
+
+    stem = glb_path.stem
+    orig_out = out_dir / f"{stem}_variant_0.glb"
+    shutil.copy(glb_path, orig_out)
+    slot_models[0] = gr.update(value=str(orig_out), visible=True, label="variant_0 (original)")
+
+    yield (
+        f"1/{total_slots} ready. Generating variants at {size_str}, tier={tier}, seed={base_seed}...",
+        *slot_models,
+        *slot_errors,
+    )
+
+    client = NunchakuClient()
+    success = 1
+
+    for v in range(1, n + 1):
+        variant_seed = base_seed + v
+        try:
+            replacements: dict[int, bytes] = {}
+            for img_idx, orig_bytes, _mime in extracted:
+                src = Image.open(io.BytesIO(orig_bytes)).convert("RGB")
+                if src.size != (w, h):
+                    src = src.resize((w, h), Image.LANCZOS)
+                buf = io.BytesIO()
+                src.save(buf, format="PNG")
+                input_bytes = buf.getvalue()
+
+                result_bytes = client.edit_image(
+                    image=input_bytes,
+                    prompt=prompt,
+                    model="nunchaku-qwen-image-edit",
+                    tier=tier,
+                    size=size_str,
+                    seed=variant_seed,
+                    output_format="png",
+                )
+                replacements[img_idx] = result_bytes
+
+            variant_out = out_dir / f"{stem}_variant_{v}.glb"
+            replace_albedo_textures(glb_path, replacements, variant_out, new_mime="image/png")
+
+            slot_models[v] = gr.update(value=str(variant_out), visible=True, label=f"variant_{v}")
+            slot_errors[v] = gr.update(value="", visible=False)
+            success += 1
+        except Exception as e:
+            slot_models[v] = gr.update(value=None, visible=True, label=f"variant_{v} (failed)")
+            slot_errors[v] = gr.update(value=f"Error: {e}", visible=True)
+
+        yield (
+            f"{success}/{total_slots} ready (variant {v} of {n} processed)...",
+            *slot_models,
+            *slot_errors,
+        )
+
+    yield (
+        f"Done. {success}/{total_slots} variants produced. Base seed: {base_seed}. Files in {out_dir}",
+        *slot_models,
+        *slot_errors,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Gradio UI
 # ---------------------------------------------------------------------------
 
@@ -250,6 +355,46 @@ with gr.Blocks(title="Nunchaku Creative Pipeline", theme=gr.themes.Soft()) as ap
             tab_pipeline,
             [pipe_gen, pipe_edit, pipe_animate, pipe_tier],
             [pipe_status, pipe_gen_out, pipe_edit_out, pipe_video_out],
+        )
+
+    # -- Tab 6: Variation Factory --
+    with gr.Tab("Variation Factory"):
+        gr.Markdown("### Game Asset Variation Factory")
+        gr.Markdown(
+            "Upload a `.glb` / `.gltf` file, pick a style, and generate N texture variants. "
+            "Each variant is a full GLB with a re-skinned albedo — drop it into Unity, Unreal, Blender, or any viewer."
+        )
+        with gr.Row():
+            with gr.Column(scale=1):
+                vf_file = gr.File(label="GLB / GLTF file", file_types=[".glb", ".gltf"], type="filepath")
+                vf_n = gr.Slider(1, MAX_VARIANTS, value=4, step=1, label="Number of variants")
+                vf_preset = gr.Dropdown(list(PRESETS.keys()), value="Rusted", label="Style preset")
+                vf_intensity = gr.Radio(["Subtle", "Moderate", "Heavy"], value="Subtle", label="Intensity")
+                vf_extra = gr.Textbox(label="Additional prompt (optional)", placeholder="e.g., with green patina", lines=1)
+                vf_quality = gr.Dropdown(
+                    ["draft (radically_fast)", "final (fast)"],
+                    value="draft (radically_fast)",
+                    label="Quality",
+                )
+                vf_seed = gr.Number(value=0, label="Base seed (0 = random)", precision=0)
+                vf_btn = gr.Button("Generate variants", variant="primary")
+                vf_status = gr.Textbox(label="Status", interactive=False)
+            with gr.Column(scale=2):
+                vf_models = []
+                vf_errors = []
+                for row_start in range(0, MAX_SLOTS, 3):
+                    with gr.Row():
+                        for slot_i in range(row_start, min(row_start + 3, MAX_SLOTS)):
+                            with gr.Column():
+                                m = gr.Model3D(label=f"variant_{slot_i}", visible=False, clear_color=[0.1, 0.1, 0.1, 1.0])
+                                err = gr.Textbox(label="", visible=False, interactive=False, lines=2)
+                                vf_models.append(m)
+                                vf_errors.append(err)
+
+        vf_btn.click(
+            tab_variation_factory,
+            [vf_file, vf_n, vf_preset, vf_intensity, vf_extra, vf_quality, vf_seed],
+            [vf_status, *vf_models, *vf_errors],
         )
 
 if __name__ == "__main__":
