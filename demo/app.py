@@ -44,7 +44,6 @@ for name in ("httpx", "httpcore"):
 sys.path.insert(0, os.path.dirname(__file__))
 from nunchaku import NunchakuClient
 from variation_factory import (
-    PRESETS,
     build_prompt,
     extract_albedo_textures,
     replace_albedo_textures,
@@ -217,7 +216,7 @@ def _describe_glb(path: Path) -> str:
         return f"<error describing {path}: {e}>"
 
 
-def tab_variation_factory(glb_file, n, preset, intensity, extra, quality, seed_in):
+def tab_variation_factory(glb_file, n, intensity, extra, quality, seed_in):
     run_started = time.time()
     if glb_file is None:
         logger.warning("variation_factory invoked with no file")
@@ -228,8 +227,8 @@ def tab_variation_factory(glb_file, n, preset, intensity, extra, quality, seed_i
     tier = "radically_fast" if "radically_fast" in quality else "fast"
 
     logger.info(
-        "variation_factory start: file=%s n=%d preset=%s intensity=%s tier=%s seed_in=%s extra=%r",
-        glb_path.name, n, preset, intensity, tier, seed_in, extra or "",
+        "variation_factory start: file=%s n=%d intensity=%s tier=%s seed_in=%s prompt=%r",
+        glb_path.name, n, intensity, tier, seed_in, extra or "",
     )
 
     base_seed = random.randint(1, 2**31 - 1) if int(seed_in) == 0 else int(seed_in)
@@ -254,7 +253,7 @@ def tab_variation_factory(glb_file, n, preset, intensity, extra, quality, seed_i
         logger.error("texture extraction failed: %s", e)
         raise gr.Error(str(e))
 
-    prompt = build_prompt(preset, intensity, extra or "")
+    prompt = build_prompt(intensity, extra or "")
 
     sample = Image.open(io.BytesIO(extracted[0][1]))
     w, h = snap_to_valid_size(*sample.size)
@@ -357,81 +356,83 @@ with gr.Blocks(title="Nunchaku Creative Pipeline", theme=gr.themes.Soft()) as ap
     gr.Markdown("# Nunchaku Creative Pipeline")
     gr.Markdown("Generate, edit, and animate images using the Nunchaku API.")
 
-    # -- Tab 1: Text-to-Image --
-    with gr.Tab("Text to Image"):
-        with gr.Row():
-            with gr.Column():
-                t2i_prompt = gr.Textbox(label="Prompt", lines=3, placeholder="Describe the image...")
-                t2i_model = gr.Dropdown(T2I_MODELS, value=T2I_MODELS[0], label="Model")
-                t2i_size = gr.Dropdown(IMAGE_SIZES, value="1024x1024", label="Size")
-                t2i_tier = gr.Dropdown(TIERS, value="fast", label="Tier")
-                t2i_seed = gr.Number(value=-1, label="Seed (-1 = random)")
-                t2i_btn = gr.Button("Generate", variant="primary")
-            with gr.Column():
-                t2i_output = gr.Image(label="Result", type="pil")
-        t2i_btn.click(tab_text_to_image, [t2i_prompt, t2i_model, t2i_size, t2i_tier, t2i_seed], t2i_output)
+    # Tabs 1-5 hidden from display (code kept for later re-enable).
+    if False:
+        # -- Tab 1: Text-to-Image --
+        with gr.Tab("Text to Image"):
+            with gr.Row():
+                with gr.Column():
+                    t2i_prompt = gr.Textbox(label="Prompt", lines=3, placeholder="Describe the image...")
+                    t2i_model = gr.Dropdown(T2I_MODELS, value=T2I_MODELS[0], label="Model")
+                    t2i_size = gr.Dropdown(IMAGE_SIZES, value="1024x1024", label="Size")
+                    t2i_tier = gr.Dropdown(TIERS, value="fast", label="Tier")
+                    t2i_seed = gr.Number(value=-1, label="Seed (-1 = random)")
+                    t2i_btn = gr.Button("Generate", variant="primary")
+                with gr.Column():
+                    t2i_output = gr.Image(label="Result", type="pil")
+            t2i_btn.click(tab_text_to_image, [t2i_prompt, t2i_model, t2i_size, t2i_tier, t2i_seed], t2i_output)
 
-    # -- Tab 2: Edit Image --
-    with gr.Tab("Edit Image"):
-        with gr.Row():
-            with gr.Column():
-                i2i_input = gr.Image(label="Input Image", type="pil")
-                i2i_prompt = gr.Textbox(label="Edit Prompt", lines=2, placeholder="Describe the edit...")
-                i2i_model = gr.Dropdown(I2I_MODELS, value=I2I_MODELS[0], label="Model")
-                i2i_tier = gr.Dropdown(TIERS, value="fast", label="Tier")
-                i2i_btn = gr.Button("Edit", variant="primary")
-            with gr.Column():
-                i2i_output = gr.Image(label="Result", type="pil")
-        i2i_btn.click(tab_edit_image, [i2i_input, i2i_prompt, i2i_model, i2i_tier], i2i_output)
+        # -- Tab 2: Edit Image --
+        with gr.Tab("Edit Image"):
+            with gr.Row():
+                with gr.Column():
+                    i2i_input = gr.Image(label="Input Image", type="pil")
+                    i2i_prompt = gr.Textbox(label="Edit Prompt", lines=2, placeholder="Describe the edit...")
+                    i2i_model = gr.Dropdown(I2I_MODELS, value=I2I_MODELS[0], label="Model")
+                    i2i_tier = gr.Dropdown(TIERS, value="fast", label="Tier")
+                    i2i_btn = gr.Button("Edit", variant="primary")
+                with gr.Column():
+                    i2i_output = gr.Image(label="Result", type="pil")
+            i2i_btn.click(tab_edit_image, [i2i_input, i2i_prompt, i2i_model, i2i_tier], i2i_output)
 
-    # -- Tab 3: Text-to-Video --
-    with gr.Tab("Text to Video"):
-        with gr.Row():
-            with gr.Column():
-                t2v_prompt = gr.Textbox(label="Prompt", lines=3, placeholder="Describe the video...")
-                t2v_model = gr.Dropdown(T2V_MODELS, value=T2V_MODELS[0], label="Model")
-                t2v_size = gr.Dropdown(VIDEO_SIZES, value="1280x720", label="Size")
-                t2v_btn = gr.Button("Generate Video", variant="primary")
-                gr.Markdown("*Video generation takes ~30 seconds.*")
-            with gr.Column():
-                t2v_output = gr.Video(label="Result")
-        t2v_btn.click(tab_text_to_video, [t2v_prompt, t2v_model, t2v_size], t2v_output)
+        # -- Tab 3: Text-to-Video --
+        with gr.Tab("Text to Video"):
+            with gr.Row():
+                with gr.Column():
+                    t2v_prompt = gr.Textbox(label="Prompt", lines=3, placeholder="Describe the video...")
+                    t2v_model = gr.Dropdown(T2V_MODELS, value=T2V_MODELS[0], label="Model")
+                    t2v_size = gr.Dropdown(VIDEO_SIZES, value="1280x720", label="Size")
+                    t2v_btn = gr.Button("Generate Video", variant="primary")
+                    gr.Markdown("*Video generation takes ~30 seconds.*")
+                with gr.Column():
+                    t2v_output = gr.Video(label="Result")
+            t2v_btn.click(tab_text_to_video, [t2v_prompt, t2v_model, t2v_size], t2v_output)
 
-    # -- Tab 4: Image-to-Video --
-    with gr.Tab("Image to Video"):
-        with gr.Row():
-            with gr.Column():
-                i2v_input = gr.Image(label="Input Image", type="pil")
-                i2v_prompt = gr.Textbox(label="Prompt", lines=2, placeholder="Describe the motion...")
-                i2v_model = gr.Dropdown(I2V_MODELS, value=I2V_MODELS[0], label="Model")
-                i2v_size = gr.Dropdown(VIDEO_SIZES, value="1280x720", label="Size")
-                i2v_btn = gr.Button("Animate", variant="primary")
-                gr.Markdown("*Video generation takes ~30 seconds.*")
-            with gr.Column():
-                i2v_output = gr.Video(label="Result")
-        i2v_btn.click(tab_image_to_video, [i2v_input, i2v_prompt, i2v_model, i2v_size], i2v_output)
+        # -- Tab 4: Image-to-Video --
+        with gr.Tab("Image to Video"):
+            with gr.Row():
+                with gr.Column():
+                    i2v_input = gr.Image(label="Input Image", type="pil")
+                    i2v_prompt = gr.Textbox(label="Prompt", lines=2, placeholder="Describe the motion...")
+                    i2v_model = gr.Dropdown(I2V_MODELS, value=I2V_MODELS[0], label="Model")
+                    i2v_size = gr.Dropdown(VIDEO_SIZES, value="1280x720", label="Size")
+                    i2v_btn = gr.Button("Animate", variant="primary")
+                    gr.Markdown("*Video generation takes ~30 seconds.*")
+                with gr.Column():
+                    i2v_output = gr.Video(label="Result")
+            i2v_btn.click(tab_image_to_video, [i2v_input, i2v_prompt, i2v_model, i2v_size], i2v_output)
 
-    # -- Tab 5: Pipeline --
-    with gr.Tab("Pipeline"):
-        gr.Markdown("### Generate → Edit → Animate")
-        gr.Markdown("Chain all three endpoints into one creative flow.")
-        with gr.Row():
-            with gr.Column():
-                pipe_gen = gr.Textbox(label="1. Generate prompt", lines=2, value="a cozy cabin in the mountains at sunset")
-                pipe_edit = gr.Textbox(label="2. Edit prompt", lines=2, value="add snow falling and northern lights in the sky")
-                pipe_animate = gr.Textbox(label="3. Animate prompt", lines=2, value="snow gently falling, lights dancing in the sky")
-                pipe_tier = gr.Dropdown(TIERS, value="fast", label="Tier (for image steps)")
-                pipe_btn = gr.Button("Run Pipeline", variant="primary")
-            with gr.Column():
-                pipe_status = gr.Textbox(label="Status", interactive=False)
-                pipe_gen_out = gr.Image(label="Generated Image", type="pil")
-                pipe_edit_out = gr.Image(label="Edited Image", type="pil")
-                pipe_video_out = gr.Video(label="Final Video")
-        pipe_btn.click(
-            tab_pipeline,
-            [pipe_gen, pipe_edit, pipe_animate, pipe_tier],
-            [pipe_status, pipe_gen_out, pipe_edit_out, pipe_video_out],
-        )
+        # -- Tab 5: Pipeline --
+        with gr.Tab("Pipeline"):
+            gr.Markdown("### Generate → Edit → Animate")
+            gr.Markdown("Chain all three endpoints into one creative flow.")
+            with gr.Row():
+                with gr.Column():
+                    pipe_gen = gr.Textbox(label="1. Generate prompt", lines=2, value="a cozy cabin in the mountains at sunset")
+                    pipe_edit = gr.Textbox(label="2. Edit prompt", lines=2, value="add snow falling and northern lights in the sky")
+                    pipe_animate = gr.Textbox(label="3. Animate prompt", lines=2, value="snow gently falling, lights dancing in the sky")
+                    pipe_tier = gr.Dropdown(TIERS, value="fast", label="Tier (for image steps)")
+                    pipe_btn = gr.Button("Run Pipeline", variant="primary")
+                with gr.Column():
+                    pipe_status = gr.Textbox(label="Status", interactive=False)
+                    pipe_gen_out = gr.Image(label="Generated Image", type="pil")
+                    pipe_edit_out = gr.Image(label="Edited Image", type="pil")
+                    pipe_video_out = gr.Video(label="Final Video")
+            pipe_btn.click(
+                tab_pipeline,
+                [pipe_gen, pipe_edit, pipe_animate, pipe_tier],
+                [pipe_status, pipe_gen_out, pipe_edit_out, pipe_video_out],
+            )
 
     # -- Tab 6: Variation Factory --
     with gr.Tab("Variation Factory"):
@@ -444,9 +445,8 @@ with gr.Blocks(title="Nunchaku Creative Pipeline", theme=gr.themes.Soft()) as ap
             with gr.Column(scale=1):
                 vf_file = gr.File(label="GLB / GLTF file", file_types=[".glb", ".gltf"], type="filepath")
                 vf_n = gr.Slider(1, MAX_VARIANTS, value=4, step=1, label="Number of variants")
-                vf_preset = gr.Dropdown(list(PRESETS.keys()), value="Rusted", label="Style preset")
                 vf_intensity = gr.Radio(["Subtle", "Moderate", "Heavy"], value="Subtle", label="Intensity")
-                vf_extra = gr.Textbox(label="Additional prompt (optional)", placeholder="e.g., with green patina", lines=1)
+                vf_extra = gr.Textbox(label="Prompt", placeholder="e.g., rusted and oxidized, with green patina", lines=3)
                 vf_quality = gr.Dropdown(
                     ["draft (radically_fast)", "final (fast)"],
                     value="draft (radically_fast)",
@@ -476,7 +476,7 @@ with gr.Blocks(title="Nunchaku Creative Pipeline", theme=gr.themes.Soft()) as ap
 
         vf_btn.click(
             tab_variation_factory,
-            [vf_file, vf_n, vf_preset, vf_intensity, vf_extra, vf_quality, vf_seed],
+            [vf_file, vf_n, vf_intensity, vf_extra, vf_quality, vf_seed],
             [vf_status, vf_variants, vf_download],
         )
 

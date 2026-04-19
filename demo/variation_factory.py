@@ -11,14 +11,6 @@ from pygltflib import GLTF2
 
 logger = logging.getLogger(__name__)
 
-PRESETS = {
-    "Rusted": "rusted and oxidized",
-    "Damaged": "worn, scratched, and damaged",
-    "Overgrown": "overgrown with moss and vines",
-    "Scorched": "scorched, burned, and blackened",
-    "Clean": "pristine and polished",
-}
-
 INTENSITIES = {
     "Subtle": "slightly",
     "Moderate": "noticeably",
@@ -28,15 +20,12 @@ INTENSITIES = {
 NEGATIVE_PROMPT = "seams, artifacts, text, watermark"
 
 
-def build_prompt(preset: str, intensity: str, user_text: str = "") -> str:
-    desc = PRESETS[preset]
+def build_prompt(intensity: str, user_text: str) -> str:
     word = INTENSITIES[intensity]
-    extra = user_text.strip()
-    suffix = f", {extra}" if extra else ""
     return (
         "You are editing the textures of a 3D object. "
-        f"\nrequest: {suffix}\namount: {word}\ndesc: {desc}. "
-        "Preserve original UV layout and material structure."
+        f"\nrequest: {user_text.strip()}"
+        f"\namount: {word}"
     )
 
 
