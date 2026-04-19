@@ -32,6 +32,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("nunchaku_demo")
 
+# Surface Gradio + uvicorn file-serving traffic so we can see which paths the
+# browser requests. httpx/httpcore stay quiet — they're mostly outbound Nunchaku
+# traffic which we already log ourselves.
+for name in ("gradio", "gradio_client", "uvicorn", "uvicorn.access", "uvicorn.error"):
+    logging.getLogger(name).setLevel(logging.DEBUG)
+for name in ("httpx", "httpcore"):
+    logging.getLogger(name).setLevel(logging.WARNING)
+
 # Allow importing nunchaku.py from the same directory
 sys.path.insert(0, os.path.dirname(__file__))
 from nunchaku import NunchakuClient
@@ -193,7 +201,20 @@ def tab_pipeline(gen_prompt, edit_prompt, animate_prompt, tier):
 # ---------------------------------------------------------------------------
 
 MAX_VARIANTS = 10
-MAX_SLOTS = MAX_VARIANTS + 1  # variant_0 (original) + N variants
+
+
+def _describe_glb(path: Path) -> str:
+    """Short diagnostic string: size, first 4 bytes (magic), exists flag."""
+    try:
+        exists = path.exists()
+        size = path.stat().st_size if exists else 0
+        magic = b""
+        if exists and size >= 4:
+            with open(path, "rb") as f:
+                magic = f.read(4)
+        return f"exists={exists} size={size} magic={magic!r} abs={path.resolve()}"
+    except Exception as e:
+        return f"<error describing {path}: {e}>"
 
 
 def tab_variation_factory(glb_file, n, preset, intensity, extra, quality, seed_in):
@@ -217,12 +238,15 @@ def tab_variation_factory(glb_file, n, preset, intensity, extra, quality, seed_i
     out_dir = Path(tempfile.mkdtemp(prefix="variation_factory_", dir=output_root))
 
     stem = glb_path.stem
+    logger.info("upload received: %s", _describe_glb(glb_path))
+
     sanitized_base = out_dir / f"{stem}_sanitized.glb"
     try:
         sanitize_glb(glb_path, sanitized_base)
     except Exception as e:
         logger.exception("sanitize_glb failed: %s", e)
         raise gr.Error(f"Could not parse GLB: {e}")
+    logger.info("sanitized base: %s", _describe_glb(sanitized_base))
 
     try:
         extracted = extract_albedo_textures(sanitized_base)
@@ -243,26 +267,21 @@ def tab_variation_factory(glb_file, n, preset, intensity, extra, quality, seed_i
     total_slots = n + 1
     orig_out = out_dir / f"{stem}_variant_0.glb"
     shutil.copy(sanitized_base, orig_out)
+    logger.info("variant_0 (original copy): %s", _describe_glb(orig_out))
 
-    # Initial yield uses gr.update() to set visibility and labels; subsequent
-    # yields pass plain values so Gradio preserves visibility and re-renders
-    # the Model3D viewers correctly.
-    init_models = [gr.update(value=None, visible=False) for _ in range(MAX_SLOTS)]
-    init_errors = [gr.update(value="", visible=False) for _ in range(MAX_SLOTS)]
-    for i in range(total_slots):
-        init_models[i] = gr.update(value=None, visible=True, label=f"variant_{i}")
-    init_models[0] = gr.update(value=str(orig_out), visible=True, label="variant_0 (original)")
+    variants: list[dict] = [
+        {"label": "variant_0 (original)", "path": str(orig_out), "error": None}
+    ]
 
+    def _downloads() -> list[str]:
+        return [v["path"] for v in variants if v["path"]]
+
+    logger.info("initial yield: showing variant_0 at %s", orig_out)
     yield (
         f"1/{total_slots} ready. Generating variants at {size_str}, tier={tier}, seed={base_seed}...",
-        *init_models,
-        *init_errors,
+        variants,
+        _downloads(),
     )
-
-    # Track slot values as plain Python values from here on
-    model_values: list[str | None] = [None] * MAX_SLOTS
-    model_values[0] = str(orig_out)
-    error_values: list[str] = [""] * MAX_SLOTS
 
     client = NunchakuClient()
     success = 1
@@ -271,6 +290,7 @@ def tab_variation_factory(glb_file, n, preset, intensity, extra, quality, seed_i
         variant_seed = base_seed + v
         v_started = time.time()
         logger.info("variant %d/%d: starting (seed=%d)", v, n, variant_seed)
+        entry: dict = {"label": f"variant_{v}", "path": None, "error": None}
         try:
             replacements: dict[int, bytes] = {}
             for img_idx, orig_bytes, _mime in extracted:
@@ -304,19 +324,18 @@ def tab_variation_factory(glb_file, n, preset, intensity, extra, quality, seed_i
             variant_out = out_dir / f"{stem}_variant_{v}.glb"
             replace_albedo_textures(sanitized_base, replacements, variant_out, new_mime="image/png")
 
-            model_values[v] = str(variant_out)
-            error_values[v] = ""
+            entry["path"] = str(variant_out)
             success += 1
             logger.info("variant %d/%d: done in %.2fs -> %s", v, n, time.time() - v_started, variant_out.name)
         except Exception as e:
             logger.exception("variant %d/%d: FAILED after %.2fs", v, n, time.time() - v_started)
-            model_values[v] = None
-            error_values[v] = f"Error: {e}"
+            entry["error"] = str(e)
 
+        variants.append(entry)
         yield (
             f"{success}/{total_slots} ready (variant {v} of {n} processed)...",
-            *model_values,
-            *error_values,
+            variants,
+            _downloads(),
         )
 
     logger.info(
@@ -325,8 +344,8 @@ def tab_variation_factory(glb_file, n, preset, intensity, extra, quality, seed_i
     )
     yield (
         f"Done. {success}/{total_slots} variants produced. Base seed: {base_seed}. Files in {out_dir}",
-        *model_values,
-        *error_values,
+        variants,
+        _downloads(),
     )
 
 
@@ -437,21 +456,31 @@ with gr.Blocks(title="Nunchaku Creative Pipeline", theme=gr.themes.Soft()) as ap
                 vf_btn = gr.Button("Generate variants", variant="primary")
                 vf_status = gr.Textbox(label="Status", interactive=False)
             with gr.Column(scale=2):
-                vf_models = []
-                vf_errors = []
-                for row_start in range(0, MAX_SLOTS, 3):
-                    with gr.Row():
-                        for slot_i in range(row_start, min(row_start + 3, MAX_SLOTS)):
-                            with gr.Column():
-                                m = gr.Model3D(label=f"variant_{slot_i}", visible=False, clear_color=[0.1, 0.1, 0.1, 1.0])
-                                err = gr.Textbox(label="", visible=False, interactive=False, lines=2)
-                                vf_models.append(m)
-                                vf_errors.append(err)
+                vf_variants = gr.State([])
+                vf_download = gr.File(label="Download .glb files", file_count="multiple", interactive=False)
+
+                @gr.render(inputs=[vf_variants])
+                def render_variants(variants):
+                    if not variants:
+                        gr.Markdown("_Upload a GLB and click Generate to see variants here._")
+                        return
+                    for row_start in range(0, len(variants), 3):
+                        with gr.Row():
+                            for entry in variants[row_start : row_start + 3]:
+                                with gr.Column():
+                                    if entry.get("error"):
+                                        gr.Markdown(f"**{entry['label']}**\n\nFailed: {entry['error']}")
+                                    else:
+                                        gr.Model3D(
+                                            value=entry["path"],
+                                            label=entry["label"],
+                                            clear_color=[0.1, 0.1, 0.1, 1.0],
+                                        )
 
         vf_btn.click(
             tab_variation_factory,
             [vf_file, vf_n, vf_preset, vf_intensity, vf_extra, vf_quality, vf_seed],
-            [vf_status, *vf_models, *vf_errors],
+            [vf_status, vf_variants, vf_download],
         )
 
 if __name__ == "__main__":
@@ -464,4 +493,6 @@ if __name__ == "__main__":
     app.queue(default_concurrency_limit=4).launch(
         share=False,
         allowed_paths=allowed,
+        debug=True,
+        show_error=True,
     )
