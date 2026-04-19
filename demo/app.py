@@ -464,18 +464,15 @@ with gr.Blocks(title="Nunchaku Creative Pipeline", theme=gr.themes.Soft()) as ap
                     if not variants:
                         gr.Markdown("_Upload a GLB and click Generate to see variants here._")
                         return
-                    for row_start in range(0, len(variants), 3):
-                        with gr.Row():
-                            for entry in variants[row_start : row_start + 3]:
-                                with gr.Column():
-                                    if entry.get("error"):
-                                        gr.Markdown(f"**{entry['label']}**\n\nFailed: {entry['error']}")
-                                    else:
-                                        gr.Model3D(
-                                            value=entry["path"],
-                                            label=entry["label"],
-                                            clear_color=[0.1, 0.1, 0.1, 1.0],
-                                        )
+                    for entry in variants:
+                        if entry.get("error"):
+                            gr.Markdown(f"**{entry['label']}**\n\nFailed: {entry['error']}")
+                        else:
+                            gr.Model3D(
+                                value=entry["path"],
+                                label=entry["label"],
+                                clear_color=[0.1, 0.1, 0.1, 1.0],
+                            )
 
         vf_btn.click(
             tab_variation_factory,
