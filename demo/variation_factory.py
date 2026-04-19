@@ -34,15 +34,19 @@ def build_prompt(preset: str, intensity: str, user_text: str = "") -> str:
     extra = user_text.strip()
     suffix = f", {extra}" if extra else ""
     return (
-        f"A tileable material texture, {word} {desc}{suffix}. "
+        "You are editing the textures of a 3D object. "
+        f"\nrequest: {suffix}\namount: {word}\ndesc: {desc}. "
         "Preserve original UV layout and material structure."
     )
 
 
 def snap_to_valid_size(w: int, h: int) -> tuple[int, int]:
-    """Square, clamped to [256, 2048], rounded down to multiple of 16."""
+    """Square, clamped to [256, 1024], rounded down to multiple of 16.
+
+    1024 ceiling keeps `fast`-tier edits under the ~60s upstream gateway timeout.
+    """
     target = max(w, h)
-    target = max(256, min(2048, target))
+    target = max(256, min(1024, target))
     target = (target // 16) * 16
     return target, target
 
